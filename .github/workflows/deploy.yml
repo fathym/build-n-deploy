@@ -41,6 +41,13 @@ on:
         description: 'Runner label when the caller has no CI_RUNNER_LABEL variable.'
         type: string
         default: 'ubuntu-latest'
+    # CALLERS MUST PASS THESE EXPLICITLY -- `secrets: inherit` DOES NOT WORK
+    # HERE. inherit does not pass secrets to a reusable workflow in a
+    # DIFFERENT organization, and every caller lives in fathym-deno or
+    # o-industrial while this workflow lives in fathym. With inherit the
+    # required check fails before the job starts: 1-second failure, no runner,
+    # no steps, no log, no annotation. Confirmed by bisection on
+    # open-industrial-web-runtime, 2026-08-24.
     secrets:
       ACR_REGISTRY:      { required: true }
       ACR_USERNAME:      { required: true }
