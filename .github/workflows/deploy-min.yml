@@ -1,0 +1,26 @@
+name: Deploy Min Test
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        type: string
+        required: true
+      test-task:
+        type: string
+        default: ''
+    secrets:
+      ACR_REGISTRY:      { required: true }
+      ACR_USERNAME:      { required: true }
+      ACR_PASSWORD:      { required: true }
+      AZURE_CREDENTIALS: { required: true }
+jobs:
+  build-and-push:
+    runs-on: ${{ vars.CI_RUNNER_LABEL || 'ubuntu-latest' }}
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - run: echo "reached, app=${{ inputs.app-name }} test=${{ inputs.test-task }}"
+      - name: conditional step
+        if: inputs.test-task != ''
+        run: echo "conditional OK"
