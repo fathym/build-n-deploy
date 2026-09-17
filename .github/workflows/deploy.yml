@@ -41,6 +41,17 @@ on:
         description: 'Runner label when the caller has no CI_RUNNER_LABEL variable.'
         type: string
         default: 'ubuntu-latest'
+      warm-only:
+        description: >-
+          Build the image but do NOT push or deploy. Used by the nightly
+          schedule to keep the daemon layer cache warm. A Deno release changes
+          the :latest digest and busts every layer including RUN deno install
+          (~87s per runtime, ~16 min fleet-wide); warming overnight means that
+          cost is paid at 4am instead of by whoever deploys next. It also means
+          a Deno release that breaks the build is found by CI rather than by a
+          production deploy.
+        type: boolean
+        default: false
     # CALLERS MUST PASS THESE EXPLICITLY -- `secrets: inherit` DOES NOT WORK
     # HERE. inherit does not pass secrets to a reusable workflow in a
     # DIFFERENT organization, and every caller lives in fathym-deno or
@@ -97,11 +108,13 @@ jobs:
           driver: docker
 
       - name: Login via Azure CLI
+        if: ${{ !inputs.warm-only }}
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Login to Azure Container Registry
+        if: ${{ !inputs.warm-only }}
         uses: azure/docker-login@v1
         with:
           login-server: ${{ secrets.ACR_REGISTRY }}
@@ -111,13 +124,15 @@ jobs:
       - name: Build the Docker image
         uses: docker/build-push-action@v6
         with:
-          push: true
+          # warm-only builds the layers into the daemon cache and stops there.
+          push: ${{ !inputs.warm-only }}
           tags: ${{ secrets.ACR_REGISTRY }}/${{ inputs.app-name }}:${{ inputs.image-tag }}
           file: ${{ inputs.dockerfile }}
           context: .
           provenance: false   # skips the attestation-manifest export
 
       - name: Deploy to Web App for Containers
+        if: ${{ !inputs.warm-only }}
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ inputs.app-name }}
