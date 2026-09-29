@@ -67,7 +67,12 @@ on:
 
 jobs:
   build-and-push:
-    runs-on: ${{ vars.CI_RUNNER_LABEL || inputs.default-runner }}
+    # CI_RUNNER_LABEL_DEPLOY wins over CI_RUNNER_LABEL so a repo can send its
+    # CI to one pool and its production deploys to another. Both resolve
+    # against the CALLER's variables, which is why a repo that flips
+    # CI_RUNNER_LABEL for its test lane silently moves its deploys too unless
+    # it also sets CI_RUNNER_LABEL_DEPLOY. Unset, this changes nothing.
+    runs-on: ${{ vars.CI_RUNNER_LABEL_DEPLOY || vars.CI_RUNNER_LABEL || inputs.default-runner }}
 
     # DELIBERATELY UNLIKE THE LIBRARY SURFACE: cancel-in-progress is false.
     # Cancelling a library build wastes a JSR version number, which is
