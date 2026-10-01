@@ -112,16 +112,27 @@ jobs:
       # 6.8 GB of cache no later job could reach, and the weekly prune cannot
       # touch a running container. @v3 removes the builder at the end of every
       # job (`cleanup`, which defaults to true -- set explicitly here because
-      # the whole no-leak argument rests on it). `keep-state` then preserves the
-      # BuildKit state volume across jobs, which the action documents as "only
-      # useful on persistent self-hosted runners": exactly this fleet. So the
-      # box keeps its warm cache and the container still does not survive.
+      # the whole no-leak argument rests on it).
+      #
+      # keep-state: false. The first v2 set it true, reasoning that the box
+      # would keep a warm local cache. It could not: the action names each
+      # run's builder `builder-<uuid>`, so no later job ever asks for the kept
+      # volume, and every build left one `buildx_buildkit_*_state` volume
+      # behind (24 of them, 16.6 GB, found when ftm-ci-runner-01's disk filled
+      # on 2026-10-01). A fixed builder name does not rescue it: one host runs
+      # up to 16 runner processes at once, so a per-host name would share one
+      # builder between concurrent jobs (and one job's cleanup would remove it
+      # under another), and a per-runner name would keep ~31 local BuildKit
+      # caches that nothing caps (buildcache-cap trims the default builder's
+      # cache only). Dropping keep-state changes no build's speed: every v2
+      # run already started locally cold and warmed from the ACR registry cache
+      # below, which is the shared cache this file exists for.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           driver: docker-container
           cleanup: true
-          keep-state: true
+          keep-state: false
 
       - name: Login via Azure CLI
         if: ${{ !inputs.warm-only }}
