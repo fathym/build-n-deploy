@@ -54,6 +54,35 @@ on:
           production deploy.
         type: boolean
         default: false
+      # THE EXTRA CHECKOUT. A caller cannot add files to the build context any
+      # other way: a job-level `uses:` lets it run no steps inside this job,
+      # and there is no build-arg, secret or context input. With
+      # extra-repository empty (the default) none of the three steps below
+      # runs and this workflow behaves exactly as before.
+      extra-repository:
+        description: >-
+          A second repository (owner/name) to check out into the build context
+          before the image build, for files the image needs that live outside
+          the caller's repo. Empty skips the extra checkout entirely.
+        type: string
+        default: ''
+      extra-ref:
+        description: 'Branch, tag or sha of extra-repository. Required when extra-repository is set: an unpinned ref would let the image content move without a commit in the caller.'
+        type: string
+        default: ''
+      extra-path:
+        description: 'Folder, relative to the caller repo root, the extra repository is checked out into. Required when extra-repository is set, and it must stay inside the build context.'
+        type: string
+        default: ''
+      extra-app-id:
+        description: >-
+          GitHub App id used to mint a read-only token for extra-repository.
+          Needed when that repository is private or in another organization.
+          Empty = the job's own GITHUB_TOKEN, which only reads the caller's
+          repository and public ones. Pass it with the EXTRA_APP_PRIVATE_KEY
+          secret.
+        type: string
+        default: ''
     # CALLERS MUST PASS THESE EXPLICITLY -- `secrets: inherit` DOES NOT WORK
     # HERE. inherit does not pass secrets to a reusable workflow in a
     # DIFFERENT organization, and every caller lives in fathym-deno or
@@ -66,6 +95,10 @@ on:
       ACR_USERNAME:      { required: true }
       ACR_PASSWORD:      { required: true }
       AZURE_CREDENTIALS: { required: true }
+      # Optional, and passed explicitly like the four above (inherit fails
+      # across organizations). The private key of the App named by
+      # extra-app-id. Never needed by a caller that sets no extra-repository.
+      EXTRA_APP_PRIVATE_KEY: { required: false }
 
 jobs:
   build-and-push:
@@ -87,6 +120,57 @@ jobs:
     steps:
       - name: Checkout the repository
         uses: actions/checkout@v4
+
+      # ── THE EXTRA CHECKOUT (all three steps skip when extra-repository is empty) ──
+      # It runs AFTER the caller's checkout, which cleans the workspace, and
+      # BEFORE the Test step and the image build, so both see the files.
+      # A half-set request is refused by name rather than guessed at: a
+      # missing ref would track a moving branch, and a path outside the
+      # workspace would land outside the build context and ship nothing.
+      - name: Check the extra checkout request
+        id: extracheck
+        if: inputs.extra-repository != ''
+        env:
+          EXTRA_REPOSITORY: ${{ inputs.extra-repository }}
+          EXTRA_REF: ${{ inputs.extra-ref }}
+          EXTRA_PATH: ${{ inputs.extra-path }}
+        run: |
+          fail() { echo "::error::extra checkout: $1"; exit 1; }
+          [[ "$EXTRA_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "extra-repository must be owner/name"
+          [ -n "$EXTRA_REF" ] || fail "extra-ref is required when extra-repository is set"
+          [ -n "$EXTRA_PATH" ] || fail "extra-path is required when extra-repository is set"
+          case "$EXTRA_PATH" in
+            /*|*..*) fail "extra-path must be a relative folder inside the repository, with no '..'" ;;
+          esac
+          echo "owner=${EXTRA_REPOSITORY%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${EXTRA_REPOSITORY##*/}" >> "$GITHUB_OUTPUT"
+          echo "extra checkout: $EXTRA_REPOSITORY at $EXTRA_REF into $EXTRA_PATH"
+
+      # The App token is scoped to that one repository, contents read only.
+      # `owner` and `repositories` are the two halves of extra-repository,
+      # split by the check step above (expressions have no split), so the
+      # token cannot read anything else the App is installed on.
+      - name: Mint a read token for the extra repository
+        id: extratoken
+        if: inputs.extra-repository != '' && inputs.extra-app-id != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ inputs.extra-app-id }}
+          private-key: ${{ secrets.EXTRA_APP_PRIVATE_KEY }}
+          owner: ${{ steps.extracheck.outputs.owner }}
+          repositories: ${{ steps.extracheck.outputs.name }}
+          permission-contents: read
+
+      - name: Checkout the extra repository
+        if: inputs.extra-repository != ''
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.extra-repository }}
+          ref: ${{ inputs.extra-ref }}
+          path: ${{ inputs.extra-path }}
+          token: ${{ steps.extratoken.outputs.token || github.token }}
+          persist-credentials: false
+          fetch-depth: 1
 
       - name: Deno Setup
         if: inputs.test-task != ''
