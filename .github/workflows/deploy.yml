@@ -83,6 +83,20 @@ on:
           secret.
         type: string
         default: ''
+      # THE OAUTH SIGNING KEY (track-30 D30.17.42). Michael, 2026-10-14, picked
+      # "Yes, make it automatically (Recommended)": each deploy checks the key
+      # exists, creates it only if it is missing, and never shows or replaces it.
+      # Off (the default), the step below does not run and nothing changes.
+      ensure-oauth-signing-key:
+        description: >-
+          Before deploying, make sure the app's OAuth signing key exists in its
+          Key Vault: the secret named by the app's OAUTH_SIGNING_KEY_REF
+          ($secret:<name>) in the vault named by its OAUTH_SIGNING_KEY_VAULT
+          setting. Present: nothing is written. Absent: a new RSA private JWK
+          (with a kid) is generated and stored as that secret. The key is never
+          printed and an existing secret is never replaced.
+        type: boolean
+        default: false
     # CALLERS MUST PASS THESE EXPLICITLY -- `secrets: inherit` DOES NOT WORK
     # HERE. inherit does not pass secrets to a reusable workflow in a
     # DIFFERENT organization, and every caller lives in fathym-deno or
@@ -173,7 +187,7 @@ jobs:
           fetch-depth: 1
 
       - name: Deno Setup
-        if: inputs.test-task != ''
+        if: inputs.test-task != '' || (inputs.ensure-oauth-signing-key && !inputs.warm-only)
         uses: denoland/setup-deno@v2
         with:
           deno-version: ${{ inputs.deno-version }}
@@ -223,6 +237,79 @@ jobs:
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # ── THE OAUTH SIGNING KEY (D30.17.42; skips unless ensure-oauth-signing-key) ──
+      # The app's own settings name the vault and the secret, so there is one
+      # source of truth: the same OAUTH_SIGNING_KEY_VAULT / OAUTH_SIGNING_KEY_REF
+      # the runtime reads at boot. Every refusal is by name and prints no value
+      # but the vault and secret NAMES. The key is generated into a 0600 temp
+      # file, handed to `az keyvault secret set --file`, and deleted; it never
+      # reaches the log. Only a SecretNotFound answer leads to a write, so a
+      # present key is never replaced and a read we were refused never becomes
+      # a guess. Runs before the deploy, so a refused write blocks it.
+      - name: Ensure the OAuth signing key
+        if: ${{ inputs.ensure-oauth-signing-key && !inputs.warm-only }}
+        env:
+          APP_NAME: ${{ inputs.app-name }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::ensure OAuth signing key: $1"; exit 1; }
+
+          rg=$(az webapp list --query "[?name=='${APP_NAME}'].resourceGroup | [0]" -o tsv) \
+            || fail "OAUTH_SIGNING_KEY_APP_UNREADABLE: the web app '${APP_NAME}' could not be listed."
+          [ -n "$rg" ] || fail "OAUTH_SIGNING_KEY_APP_NOT_FOUND: no web app named '${APP_NAME}'."
+
+          setting() {
+            az webapp config appsettings list --name "$APP_NAME" --resource-group "$rg" \
+              --query "[?name=='$1'].value | [0]" -o tsv
+          }
+          vault=$(setting OAUTH_SIGNING_KEY_VAULT) \
+            || fail "OAUTH_SIGNING_KEY_SETTINGS_UNREADABLE: the app settings of '${APP_NAME}' could not be read."
+          ref=$(setting OAUTH_SIGNING_KEY_REF) \
+            || fail "OAUTH_SIGNING_KEY_SETTINGS_UNREADABLE: the app settings of '${APP_NAME}' could not be read."
+
+          [ -n "$vault" ] || fail "OAUTH_SIGNING_KEY_VAULT_MISSING: '${APP_NAME}' has no OAUTH_SIGNING_KEY_VAULT setting."
+          case "$ref" in
+            '$secret:'?*) name="${ref#\$secret:}" ;;
+            *) fail "OAUTH_SIGNING_KEY_REF_NOT_A_REFERENCE: '${APP_NAME}' OAUTH_SIGNING_KEY_REF must be a \$secret:<name> reference." ;;
+          esac
+          [[ "$name" =~ ^[A-Za-z0-9-]{1,127}$ ]] \
+            || fail "OAUTH_SIGNING_KEY_REF_NAME_INVALID: the referenced secret name is not a Key Vault secret name."
+
+          if out=$(az keyvault secret show --vault-name "$vault" --name "$name" --query id -o tsv 2>&1); then
+            echo "OAuth signing key '${name}' is present in vault '${vault}'; nothing written."
+            exit 0
+          fi
+          case "$out" in
+            *SecretNotFound*) ;;
+            *Forbidden*|*"does not have secrets get permission"*)
+              fail "OAUTH_SIGNING_KEY_VAULT_FORBIDDEN: the deploy identity may not read secrets in vault '${vault}'. Grant it Key Vault Secrets Officer on that vault." ;;
+            *) fail "OAUTH_SIGNING_KEY_VAULT_UNREADABLE: secret '${name}' in vault '${vault}' could not be read." ;;
+          esac
+
+          umask 077
+          keyfile=$(mktemp)
+          trap 'rm -f "$keyfile"' EXIT
+          deno eval '
+            const pair = await crypto.subtle.generateKey(
+              { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+              true,
+              ["sign", "verify"],
+            );
+            const jwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
+            const { kty, n, e, d, p, q, dp, dq, qi } = jwk;
+            await Deno.stdout.write(new TextEncoder().encode(JSON.stringify({ kty, kid: crypto.randomUUID(), n, e, d, p, q, dp, dq, qi })));
+          ' > "$keyfile"
+
+          if ! err=$(az keyvault secret set --vault-name "$vault" --name "$name" --file "$keyfile" \
+            --content-type application/jwk+json --query id -o tsv 2>&1 >/dev/null); then
+            case "$err" in
+              *Forbidden*|*"does not have secrets set permission"*)
+                fail "OAUTH_SIGNING_KEY_VAULT_FORBIDDEN: the deploy identity may not set secrets in vault '${vault}'. Grant it Key Vault Secrets Officer on that vault." ;;
+              *) fail "OAUTH_SIGNING_KEY_WRITE_FAILED: secret '${name}' could not be written to vault '${vault}'." ;;
+            esac
+          fi
+          echo "OAuth signing key '${name}' was missing from vault '${vault}' and has been created."
 
       # Unconditional, unlike the azure/login above: a warm-only run deploys
       # nothing, but it DOES write the shared build cache into the ACR, and that
