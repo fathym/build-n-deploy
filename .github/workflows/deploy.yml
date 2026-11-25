@@ -18,9 +18,17 @@ on:
   workflow_call:
     inputs:
       app-name:
-        description: 'Azure Web App name. Also the ACR image name. The only required input.'
+        description: 'the ACR image path (may hold slashes, e.g. fathym/prerelease/<repo>); also the Web App name when deploy is true'
         type: string
         required: true
+      # v4. false = publish only: build and push the image, and stop. No
+      # azure/login, no webapps-deploy, and AZURE_CREDENTIALS is not read. A
+      # v2/v3 caller passes no deploy, so it defaults to true and deploys as
+      # before.
+      deploy:
+        description: 'Deploy the pushed image to the Web App named app-name. false = build and push only.'
+        type: boolean
+        default: true
       image-tag:
         description: 'ACR image tag.'
         type: string
@@ -83,6 +91,12 @@ on:
           secret.
         type: string
         default: ''
+    # v4. The digest build-push-action pushed (sha256:...), for callers that
+    # pin images by digest. Empty on a warm-only run, which pushes nothing.
+    outputs:
+      digest:
+        description: 'The digest of the pushed image.'
+        value: ${{ jobs.build-and-push.outputs.digest }}
     # CALLERS MUST PASS THESE EXPLICITLY -- `secrets: inherit` DOES NOT WORK
     # HERE. inherit does not pass secrets to a reusable workflow in a
     # DIFFERENT organization, and every caller lives in fathym-deno or
@@ -94,7 +108,10 @@ on:
       ACR_REGISTRY:      { required: true }
       ACR_USERNAME:      { required: true }
       ACR_PASSWORD:      { required: true }
-      AZURE_CREDENTIALS: { required: true }
+      # Needed whenever deploy is true (the default). Optional so a
+      # publish-only caller (deploy: false) need not hold it; a deploying run
+      # with it empty fails by name in the first step.
+      AZURE_CREDENTIALS: { required: false }
       # Optional, and passed explicitly like the four above (inherit fails
       # across organizations). The private key of the App named by
       # extra-app-id. Never needed by a caller that sets no extra-repository.
@@ -117,7 +134,24 @@ jobs:
       group: deploy-${{ github.repository }}-${{ github.ref }}
       cancel-in-progress: false
 
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
     steps:
+      # Secrets cannot be read in an `if` (GitHub docs, "Using secrets in
+      # GitHub Actions"), so the secret is handed to this one step as env and
+      # tested in the shell. It runs first, so a missing secret fails in
+      # seconds rather than after a build. Skipped when not deploying, so a
+      # publish-only run never reads AZURE_CREDENTIALS.
+      - name: Check the Azure credentials
+        if: ${{ !inputs.warm-only && inputs.deploy }}
+        env:
+          AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+        run: |
+          [ -n "$AZURE_CREDENTIALS" ] && exit 0
+          echo "::error::AZURE_CREDENTIALS is empty: deploy is true (the default), so this run signs in to Azure and deploys the Web App. Pass the AZURE_CREDENTIALS secret, or set deploy: false to build and push only."
+          exit 1
+
       - name: Checkout the repository
         uses: actions/checkout@v4
 
@@ -219,7 +253,7 @@ jobs:
           keep-state: false
 
       - name: Login via Azure CLI
-        if: ${{ !inputs.warm-only }}
+        if: ${{ !inputs.warm-only && inputs.deploy }}
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
@@ -236,6 +270,7 @@ jobs:
           password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Build the Docker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           # warm-only builds the layers into the shared cache and stops there.
@@ -259,8 +294,21 @@ jobs:
           cache-from: type=registry,ref=${{ secrets.ACR_REGISTRY }}/${{ inputs.app-name }}:buildcache
           cache-to: type=registry,ref=${{ secrets.ACR_REGISTRY }}/${{ inputs.app-name }}:buildcache,mode=max,ignore-error=true
 
-      - name: Deploy to Web App for Containers
+      # Before the deploy, so a failed deploy still shows what was pushed. The
+      # registry host is a secret (the log would mask it), so the line names
+      # the path inside the registry only.
+      - name: Record the digest
         if: ${{ !inputs.warm-only }}
+        env:
+          APP_NAME: ${{ inputs.app-name }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          echo "path=${APP_NAME} version=${IMAGE_TAG} digest=${DIGEST}"
+          echo "path=${APP_NAME} version=${IMAGE_TAG} digest=${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy to Web App for Containers
+        if: ${{ !inputs.warm-only && inputs.deploy }}
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ inputs.app-name }}
